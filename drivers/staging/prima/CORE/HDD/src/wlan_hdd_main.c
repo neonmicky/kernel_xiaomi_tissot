@@ -227,6 +227,11 @@ static vos_wake_lock_t wlan_wake_lock;
 /* set when SSR is needed after unload */
 static e_hdd_ssr_required isSsrRequired = HDD_SSR_NOT_REQUIRED;
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0))
+#define WLAN_NV_FILE_SIZE 64
+static char wlan_nv_bin[WLAN_NV_FILE_SIZE];
+#endif
+
 //internal function declaration
 static VOS_STATUS wlan_hdd_framework_restart(hdd_context_t *pHddCtx);
 static void wlan_hdd_restart_init(hdd_context_t *pHddCtx);
@@ -252,15 +257,21 @@ void hdd_set_wlan_suspend_mode(bool suspend);
 void hdd_set_vowifi_mode(hdd_context_t *hdd_ctx, bool enable);
 void hdd_set_olpc_mode(tHalHandle hHal, bool low_power);
 
-v_U16_t hdd_select_queue(struct net_device *dev,
-    struct sk_buff *skb
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0))
-    , void *accel_priv
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			  struct net_device *sb_dev,
+			  select_queue_fallback_t fallback);
+
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			  void *accel_priv, select_queue_fallback_t fallback);
+
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0))
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			  void *accel_priv);
+#else
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb);
 #endif
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
-    , select_queue_fallback_t fallback
-#endif
-);
 
 #ifdef WLAN_FEATURE_PACKET_FILTERING
 static void hdd_set_multicast_list(struct net_device *dev);
@@ -3893,7 +3904,7 @@ int hdd_get_disable_ch_list(hdd_context_t *hdd_ctx, tANI_U8 *buf,
 }
 
 #ifdef FEATURE_WLAN_SW_PTA
-static void hdd_sco_resp_callback(uint8_t sco_status)
+static void hdd_sw_pta_resp_callback(uint8_t sw_pta_status)
 {
 	hdd_context_t *hdd_ctx = NULL;
 	v_CONTEXT_t vos_ctx = NULL;
@@ -3913,12 +3924,12 @@ static void hdd_sco_resp_callback(uint8_t sco_status)
 		return;
 	}
 
-	hddLog(VOS_TRACE_LEVEL_DEBUG, "%s: Response status %d",
-	       __func__, sco_status);
+	hddLog(VOS_TRACE_LEVEL_DEBUG, "%s: sw pta response status %d",
+	       __func__, sw_pta_status);
 
-	if (sco_status) {
-		hddLog(VOS_TRACE_LEVEL_FATAL, "%s: Invalid sco status %d",
-		       __func__, sco_status);
+	if (sw_pta_status) {
+		hddLog(VOS_TRACE_LEVEL_FATAL, "%s: Invalid sw pta status %d",
+		       __func__, sw_pta_status);
 		return;
 	}
 
@@ -3926,15 +3937,15 @@ static void hdd_sco_resp_callback(uint8_t sco_status)
 }
 
 int hdd_process_bt_sco_profile(hdd_context_t *hdd_ctx,
-			       bool bt_enabled, bool bt_sco)
+			       bool bt_enabled, bool bt_adv,
+			       bool ble_enabled, bool bt_a2dp,
+			       bool bt_sco)
 {
 	tpAniSirGlobal mac_ctx = PMAC_STRUCT(hdd_ctx->hHal);
-	uint8_t no_of_states_changed = 0;
 	hdd_station_ctx_t *hdd_sta_ctx;
 	eConnectionState conn_state;
 	hdd_adapter_t *adapter;
 	eHalStatus hal_status;
-	bool sco_status;
 	int rc;
 
 	if (!mac_ctx) {
@@ -3942,68 +3953,11 @@ int hdd_process_bt_sco_profile(hdd_context_t *hdd_ctx,
 		return -EINVAL;
 	}
 
-	/**
-	 * At a time only one status can be changed compared to
-	 * previous command (BT_ENABLED/SCO)
-	 * If no.of states changed is greater than one it is
-	 * an invalid command.
-	 */
-	if (bt_enabled != hdd_ctx->is_bt_enabled)
-		no_of_states_changed++;
-
-	if (bt_sco != hdd_ctx->is_sco_enabled)
-		no_of_states_changed++;
-
-	if (no_of_states_changed > 1) {
-		hddLog(VOS_TRACE_LEVEL_ERROR, "%s: Multiple states changed",
-		       __func__);
-		return -EINVAL;
-	}
-
 	INIT_COMPLETION(hdd_ctx->sw_pta_comp);
 
-	if (bt_enabled != hdd_ctx->is_bt_enabled) {
-		hal_status = sme_bt_req(hdd_ctx->hHal,
-					hdd_sco_resp_callback,
-					adapter->sessionId, bt_enabled);
-		if (!HAL_STATUS_SUCCESS(hal_status)) {
-			hddLog(VOS_TRACE_LEVEL_ERROR,
-			       "%s: Error sending sme sco indication request",
-			       __func__);
-			return -EINVAL;
-		}
-
-		rc = wait_for_completion_timeout(&hdd_ctx->sw_pta_comp,
-				msecs_to_jiffies(WLAN_WAIT_TIME_SW_PTA));
-		if (!rc) {
-			hddLog(VOS_TRACE_LEVEL_ERROR,
-			       FL("Target response timed out for sw_pta_comp"));
-			return -EINVAL;
-		}
-
-		hdd_ctx->is_bt_enabled = bt_enabled;
-		return 0;
-	}
-
-	if (bt_sco) {
-		if (hdd_ctx->is_sco_enabled) {
-			hddLog(VOS_TRACE_LEVEL_ERROR,
-			       "%s: BT SCO is already enabled", __func__);
-			return 0;
-		}
-		sco_status = true;
-	} else {
-		if (!hdd_ctx->is_sco_enabled) {
-			hddLog(VOS_TRACE_LEVEL_ERROR,
-			       "%s: BT SCO is already disabled", __func__);
-			return 0;
-		}
-		sco_status = false;
-	}
-
-	hal_status = sme_sco_req(hdd_ctx->hHal,
-				 hdd_sco_resp_callback,
-				 adapter->sessionId, sco_status);
+	hal_status = sme_sw_pta_req(hdd_ctx->hHal, hdd_sw_pta_resp_callback,
+				    adapter->sessionId, bt_enabled,
+				    bt_adv, ble_enabled, bt_a2dp, bt_sco);
 	if (!HAL_STATUS_SUCCESS(hal_status)) {
 		hddLog(VOS_TRACE_LEVEL_ERROR,
 		       "%s: Error sending sme sco indication request",
@@ -4019,7 +3973,18 @@ int hdd_process_bt_sco_profile(hdd_context_t *hdd_ctx,
 		return -EINVAL;
 	}
 
-	if (!bt_sco) {
+	if (bt_sco) {
+		if (hdd_ctx->is_sco_enabled) {
+			hddLog(VOS_TRACE_LEVEL_ERROR,
+			       "%s: BT SCO is already enabled", __func__);
+			return 0;
+		}
+	} else {
+		if (!hdd_ctx->is_sco_enabled) {
+			hddLog(VOS_TRACE_LEVEL_ERROR,
+			       "%s: BT SCO is already disabled", __func__);
+			return 0;
+		}
 		hdd_ctx->is_sco_enabled = false;
 		mac_ctx->isCoexScoIndSet = 0;
 		return 0;
@@ -8740,6 +8705,19 @@ VOS_STATUS hdd_release_firmware(char *pFileName,v_VOID_t *pCtx)
    return status;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0))
+char* hdd_get_nv_bin()
+{
+	if (wcnss_get_nv_name(wlan_nv_bin)) {
+		hddLog(VOS_TRACE_LEVEL_ERROR,
+		       "%s: NV binary is invalid", __func__);
+		return NULL;
+	}
+
+	return wlan_nv_bin;
+}
+#endif
+
 /**---------------------------------------------------------------------------
 
   \brief hdd_request_firmware() -
@@ -10139,14 +10117,6 @@ hdd_adapter_t* hdd_open_adapter( hdd_context_t *pHddCtx, tANI_U8 session_type,
          pAdapter->device_mode = session_type;
 
          hdd_initialize_adapter_common(pAdapter);
-
-         status = hdd_sta_id_hash_attach(pAdapter);
-         if (VOS_STATUS_SUCCESS != status)
-         {
-             hddLog(VOS_TRACE_LEVEL_FATAL,
-                    FL("failed to attach hash for session %d"), session_type);
-             goto err_free_netdev;
-         }
 
          status = hdd_register_hostapd( pAdapter, rtnl_held );
          if( VOS_STATUS_SUCCESS != status )
@@ -11717,12 +11687,6 @@ VOS_STATUS hdd_start_all_adapters( hdd_context_t *pHddCtx )
          case WLAN_HDD_SOFTAP:
             if (pHddCtx->cfg_ini->sap_internal_restart) {
                 hdd_init_ap_mode(pAdapter, true);
-                status = hdd_sta_id_hash_attach(pAdapter);
-                if (VOS_STATUS_SUCCESS != status)
-                {
-                    hddLog(VOS_TRACE_LEVEL_FATAL,
-                         FL("failed to attach hash for"));
-                }
             }
             break;
 
@@ -12262,19 +12226,31 @@ static void hdd_set_multicast_list(struct net_device *dev)
   \return - ac, Queue Index/access category corresponding to UP in IP header 
   
   --------------------------------------------------------------------------*/
-v_U16_t hdd_select_queue(struct net_device *dev,
-    struct sk_buff *skb
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0))
-    , void *accel_priv
-#endif
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
-    , select_queue_fallback_t fallback
-#endif
-)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			 struct net_device *sb_dev,
+			 select_queue_fallback_t fallback)
 {
-   return hdd_wmm_select_queue(dev, skb);
+	return hdd_wmm_select_queue(dev, skb);
 }
-
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			 void *accel_priv, select_queue_fallback_t fallback)
+{
+	return hdd_wmm_select_queue(dev, skb);
+}
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0))
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			 void *accel_priv)
+{
+	return hdd_wmm_select_queue(dev, skb);
+}
+#else
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb)
+{
+	return hdd_wmm_select_queue(dev, skb);
+}
+#endif
 
 /**---------------------------------------------------------------------------
 
@@ -14178,6 +14154,7 @@ int hdd_wlan_startup(struct device *dev )
 #endif /* WLAN_KD_READY_NOTIFIER */
 
    vos_set_roam_delay_stats_enabled(pHddCtx->cfg_ini->gEnableRoamDelayStats);
+   hdd_init_sw_pta(pHddCtx);
    status = vos_open( &pVosContext, pHddCtx->parent_dev);
    if ( !VOS_IS_STATUS_SUCCESS( status ))
    {
@@ -14826,7 +14803,7 @@ int hdd_wlan_startup(struct device *dev )
 
    mutex_init(&pHddCtx->cache_channel_lock);
 
-   hdd_init_sw_pta(pHddCtx);
+   wcnss_update_bt_profile();
    goto success;
 
 err_open_cesium_nl_sock:
@@ -16302,8 +16279,12 @@ void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind)
    hdd_context_t *hdd_ctx = NULL;
    hdd_adapter_t *adapter = NULL;
    v_CONTEXT_t vos_context = NULL;
+   tANI_U8 type = 0;
+   tANI_U8 subType = 0;
    struct ieee80211_mgmt *mgmt =
            (struct ieee80211_mgmt *)frame_ind->frameBuf;
+   tANI_U8* pbFrames;
+   tANI_U32 nFrameLength;
 
    /* Get the global VOSS context.*/
    vos_context = vos_get_global_context(VOS_MODULE_ID_SYS, NULL);
@@ -16325,7 +16306,38 @@ void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind)
         return;
    }
 
-   adapter = hdd_get_adapter_by_sme_session_id(hdd_ctx,
+   /* Try to retrieve the adapter from the mac address list*/
+     type = WLAN_HDD_GET_TYPE_FRM_FC(pbFrames[0]);
+     subType = WLAN_HDD_GET_SUBTYPE_FRM_FC(pbFrames[0]);
+     pbFrames = frame_ind->frameBuf;
+     nFrameLength = frame_ind->frameLen;
+
+    /* Get pAdapter from Destination mac address of the frame */
+    if ((type == SIR_MAC_MGMT_FRAME) &&
+        (subType != SIR_MAC_MGMT_PROBE_REQ) &&
+        (frame_ind->frameLen > WLAN_HDD_80211_FRM_DA_OFFSET + VOS_MAC_ADDR_SIZE)
+	&&
+        !vos_is_macaddr_broadcast(
+         (v_MACADDR_t *)&pbFrames[WLAN_HDD_80211_FRM_DA_OFFSET]))
+      {
+         adapter = hdd_get_adapter_by_macaddr(hdd_ctx,
+                               &pbFrames[WLAN_HDD_80211_FRM_DA_OFFSET]);
+         if (NULL == adapter)
+         {
+             /* Under assumtion that we don't receive any action frame
+              * with BCST as destination we dropping action frame
+              */
+             hddLog(VOS_TRACE_LEVEL_FATAL,"pAdapter for action frame is NULL Macaddr = "
+                               MAC_ADDRESS_STR ,
+                               MAC_ADDR_ARRAY(&pbFrames[WLAN_HDD_80211_FRM_DA_OFFSET]));
+             hddLog(VOS_TRACE_LEVEL_FATAL, "%s: Frame Type = %d Frame Length = %d"
+                              " subType = %d",__func__,frame_ind->frameType,nFrameLength,subType);
+             return;
+         }
+       }
+
+   if (adapter == NULL)
+       adapter = hdd_get_adapter_by_sme_session_id(hdd_ctx,
                                           frame_ind->sessionId);
 
    if ((NULL != adapter) &&
